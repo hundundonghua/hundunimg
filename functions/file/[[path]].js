@@ -3,14 +3,21 @@ import { fetchSecurityConfig } from "../utils/sysConfig";
 import { TelegramAPI } from "../utils/storage/telegramAPI";
 import { DiscordAPI } from "../utils/storage/discordAPI";
 import { HuggingFaceAPI } from "../utils/storage/huggingfaceAPI";
-import { WebDAVAPI } from "../utils/storage/webdavAPI";
-import { resolveWebDAVConfig } from "../utils/webdavConfig";
+import { buildWebDAVUrl, WebDAVAPI } from "../utils/storage/webdavAPI";
 import {
     setCommonHeaders, setRangeHeaders, handleHeadRequest, getFileContent, isTgChannel,
     returnWithCheck, return404, returnBlockImg, isDomainAllowed, FILE_CACHE_CONTROL
 } from './fileTools';
 import { getDatabase } from '../utils/databaseAdapter.js';
 import { authenticate, AUTH_SCOPE } from '../utils/auth/authCore.js';
+import {
+    resolveDiscordCredentials,
+    resolveHuggingFaceCredentials,
+    resolveS3Credentials,
+    resolveTelegramCredentials,
+    resolveWebDAVCredentials,
+} from '../utils/metadata/channelCredentials.js';
+import { buildCdnFileUrl } from '../utils/metadata/metadataView.js';
 
 
 export async function onRequest(context) {  // Contents of context object
@@ -22,42 +29,6 @@ export async function onRequest(context) {  // Contents of context object
         next, // used for middleware or to fetch assets
         data, // arbitrary space for passing data between middlewares
     } = context;
-
-    const url = new URL(request.url);
-
-    // ====================================================
-    // 1. 安全校验：非管理员预览请求，必须校验短期数字签名
-    // ====================================================
-    const fromAdmin = url.searchParams.get('from') === 'admin';
-    if (!fromAdmin) {
-        const secretKey = env.SECURE_TOKEN_SECRET;
-        
-        // 只有在 Cloudflare 后台配置了 SECURE_TOKEN_SECRET 变量时才强制启用校验
-        if (secretKey) {
-            const token = url.searchParams.get('token');
-            const expires = url.searchParams.get('expires');
-
-            if (!token || !expires) {
-                return new Response('Error: Access Denied (Missing Signature Token)', { status: 403 });
-            }
-
-            // 检查链接是否已过期
-            const now = Math.floor(Date.now() / 1000);
-            if (now > parseInt(expires, 10)) {
-                return new Response('Error: Link Expired', { status: 403 });
-            }
-
-            // 验证签名完整性 (匹配：文件路径 + 到期时间戳)
-            // 使用 decodeURIComponent 对路径强制解码，确保与 PHP 端明文一致
-            const filePath = decodeURIComponent(url.pathname); 
-            const message = `${filePath}|${expires}`;
-            const isValid = await verifyHmacSha256(message, token, secretKey);
-            if (!isValid) {
-                return new Response('Error: Invalid Signature Token', { status: 403 });
-            }
-        }
-    }
-    // ====================================================
 
     // 解码文件ID
     let fileId = '';
@@ -72,6 +43,7 @@ export async function onRequest(context) {  // Contents of context object
     const securityConfig = await fetchSecurityConfig(env);
     context.securityConfig = securityConfig;
 
+    const url = new URL(request.url);
     context.url = url;
 
     const Referer = request.headers.get('Referer')
@@ -165,8 +137,9 @@ export async function onRequest(context) {  // Contents of context object
         }
 
         // 获取TG图片真实地址（支持代理域名）
-        const TgBotToken = imgRecord.metadata?.TgBotToken || env.TG_BOT_TOKEN;
-        const TgProxyUrl = imgRecord.metadata?.TgProxyUrl || '';
+        const tgCredentials = await resolveTelegramCredentials(db, env, imgRecord.metadata);
+        const TgBotToken = tgCredentials.botToken;
+        const TgProxyUrl = tgCredentials.proxyUrl || '';
         const tgApi = new TelegramAPI(TgBotToken, TgProxyUrl);
         const filePath = await tgApi.getFilePath(TgFileID);
         if (filePath === null) {
@@ -240,8 +213,10 @@ async function handleTelegramChunkedFile(context, imgRecord, encodedFileName, fi
     const { env, request, url, Referer } = context;
 
     const metadata = imgRecord.metadata;
-    const TgBotToken = metadata.TgBotToken || env.TG_BOT_TOKEN;
-    const TgProxyUrl = metadata.TgProxyUrl || '';
+    const db = getDatabase(env);
+    const tgCredentials = await resolveTelegramCredentials(db, env, metadata);
+    const TgBotToken = tgCredentials.botToken;
+    const TgProxyUrl = tgCredentials.proxyUrl || '';
 
     // 从KV的value中读取分片信息
     let chunks = [];
@@ -428,11 +403,14 @@ async function fetchTelegramChunkWithRetry(botToken, chunk, proxyUrl = '', maxRe
 
 // 处理 Discord 渠道分片文件读取
 async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fileType) {
-    const { request, url, Referer } = context;
+    const { env, request, url, Referer } = context;
 
     const metadata = imgRecord.metadata;
-    const botToken = metadata.DiscordBotToken;
-    const proxyUrl = metadata.DiscordProxyUrl;
+    const db = getDatabase(env);
+    const discordCredentials = await resolveDiscordCredentials(db, env, metadata);
+    const botToken = discordCredentials.botToken;
+    const channelId = discordCredentials.channelId;
+    const proxyUrl = discordCredentials.proxyUrl;
 
     // 从KV的value中读取分片信息
     let chunks = [];
@@ -530,7 +508,7 @@ async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fil
                         }
 
                         // 获取分片数据（每次通过 API 获取新的附件 URL）
-                        const chunkData = await fetchDiscordChunkWithRetry(botToken, metadata.DiscordChannelId, chunk, proxyUrl, 3);
+                        const chunkData = await fetchDiscordChunkWithRetry(botToken, channelId, chunk, proxyUrl, 3);
                         if (!chunkData) {
                             throw new Error(`Failed to fetch Discord chunk ${chunk.index} after retries`);
                         }
@@ -539,7 +517,7 @@ async function handleDiscordChunkedFile(context, imgRecord, encodedFileName, fil
                         const chunkStart = Math.max(0, rangeStart - currentPosition);
                         const chunkEnd = Math.min(chunkSize, rangeEnd - currentPosition + 1);
 
-                        // 如果需要部分分片 data
+                        // 如果需要部分分片数据
                         if (chunkStart > 0 || chunkEnd < chunkSize) {
                             const partialData = chunkData.slice(chunkStart, chunkEnd);
                             controller.enqueue(partialData);
@@ -707,7 +685,7 @@ async function handleS3File(context, metadata, encodedFileName, fileType) {
     const { Referer, url, request } = context;
 
     // 检查是否配置了 CDN 文件完整路径
-    const cdnFileUrl = metadata?.S3CdnFileUrl;
+    const cdnFileUrl = await getS3CdnFileUrl(context.env, metadata);
 
     // 如果配置了 CDN 文件路径，通过 CDN 读取文件
     if (cdnFileUrl) {
@@ -768,22 +746,35 @@ async function handleS3File(context, metadata, encodedFileName, fileType) {
     return await handleS3FileViaAPI(context, metadata, encodedFileName, fileType);
 }
 
+async function getS3CdnFileUrl(env, metadata) {
+    try {
+        const db = getDatabase(env);
+        const s3Credentials = await resolveS3Credentials(db, env, metadata);
+        return buildCdnFileUrl(s3Credentials.cdnDomain, s3Credentials.key);
+    } catch (error) {
+        console.warn('Failed to build S3 CDN file URL:', error.message);
+        return '';
+    }
+}
+
 // 通过 S3 API 读取文件
 async function handleS3FileViaAPI(context, metadata, encodedFileName, fileType) {
-    const { Referer, url, request } = context;
+    const { Referer, url, request, env } = context;
+    const db = getDatabase(env);
+    const s3Credentials = await resolveS3Credentials(db, env, metadata);
 
     const s3Client = new S3Client({
-        region: metadata?.S3Region || "auto",
-        endpoint: metadata?.S3Endpoint,
+        region: s3Credentials.region || "auto",
+        endpoint: s3Credentials.endpoint,
         credentials: {
-            accessKeyId: metadata?.S3AccessKeyId,
-            secretAccessKey: metadata?.S3SecretAccessKey
+            accessKeyId: s3Credentials.accessKeyId,
+            secretAccessKey: s3Credentials.secretAccessKey
         },
-        forcePathStyle: metadata?.S3PathStyle || false
+        forcePathStyle: s3Credentials.pathStyle || false
     });
 
-    const bucketName = metadata?.S3BucketName;
-    const key = metadata?.S3FileKey;
+    const bucketName = s3Credentials.bucketName;
+    const key = s3Credentials.key;
 
     try {
         // 检查Range请求头
@@ -837,11 +828,13 @@ async function handleDiscordFile(context, metadata, encodedFileName, fileType) {
     const { env, request, url, Referer } = context;
 
     try {
+        const db = getDatabase(env);
+        const discordCredentials = await resolveDiscordCredentials(db, env, metadata);
         // 每次读取都通过 API 获取新的附件 URL（因为 Discord 附件 URL 会在约24小时后过期）
         let fileUrl = null;
-        if (metadata.DiscordMessageId && metadata.DiscordChannelId && metadata.DiscordBotToken) {
-            const discordAPI = new DiscordAPI(metadata.DiscordBotToken);
-            fileUrl = await discordAPI.getFileURL(metadata.DiscordChannelId, metadata.DiscordMessageId);
+        if (discordCredentials.messageId && discordCredentials.channelId && discordCredentials.botToken) {
+            const discordAPI = new DiscordAPI(discordCredentials.botToken);
+            fileUrl = await discordAPI.getFileURL(discordCredentials.channelId, discordCredentials.messageId);
         }
 
         if (!fileUrl) {
@@ -849,8 +842,8 @@ async function handleDiscordFile(context, metadata, encodedFileName, fileType) {
         }
 
         // 如果配置了代理 URL，替换 Discord CDN 域名
-        if (metadata.DiscordProxyUrl) {
-            fileUrl = fileUrl.replace('https://cdn.discordapp.com', `https://${metadata.DiscordProxyUrl}`);
+        if (discordCredentials.proxyUrl) {
+            fileUrl = fileUrl.replace('https://cdn.discordapp.com', `https://${discordCredentials.proxyUrl}`);
         }
 
         // 处理 HEAD 请求
@@ -901,25 +894,31 @@ async function handleDiscordFile(context, metadata, encodedFileName, fileType) {
 
 // 处理 HuggingFace 文件读取
 async function handleHuggingFaceFile(context, metadata, encodedFileName, fileType) {
-    const { request, url, Referer } = context;
+    const { env, request, url, Referer } = context;
 
     try {
-        const hfRepo = metadata.HfRepo;
-        const hfFilePath = metadata.HfFilePath;
-        const hfToken = metadata.HfToken;
-        const hfIsPrivate = metadata.HfIsPrivate || false;
+        const db = getDatabase(env);
+        const hfCredentials = await resolveHuggingFaceCredentials(db, env, metadata);
+        const hfRepo = hfCredentials.repo;
+        const hfFilePath = hfCredentials.filePath;
+        const hfToken = hfCredentials.token;
+        const hfIsPrivate = hfCredentials.isPrivate || false;
 
         if (!hfRepo || !hfFilePath) {
             return new Response('Error: HuggingFace file info not found', { status: 500 });
         }
 
         // 构建文件 URL
-        const fileUrl = metadata.HfFileUrl || `https://huggingface.co/datasets/${hfRepo}/resolve/main/${hfFilePath}`;
+        const fileUrl = `https://huggingface.co/datasets/${hfRepo}/resolve/main/${hfFilePath}`;
+        const fileSize = HuggingFaceAPI.getMetadataFileSize(metadata);
 
         // 处理 HEAD 请求
         if (request.method === 'HEAD') {
             const headers = new Headers();
             setCommonHeaders(headers, encodedFileName, fileType, getFileCacheControl(context));
+            if (fileSize) {
+                headers.set('Content-Length', fileSize.toString());
+            }
             return handleHeadRequest(headers);
         }
 
@@ -974,8 +973,10 @@ async function handleWebDAVFile(context, metadata, encodedFileName, fileType) {
     const { request, url, Referer } = context;
 
     try {
-        const filePath = metadata.WebDAVFilePath;
-        const publicUrl = metadata.WebDAVPublicUrl;
+        const db = getDatabase(context.env);
+        const webdavCredentials = await resolveWebDAVCredentials(db, context.env, metadata);
+        const filePath = webdavCredentials.filePath;
+        const publicUrl = getWebDAVPublicFileUrl(webdavCredentials, filePath);
 
         if (!filePath && !publicUrl) {
             return new Response('Error: WebDAV file info not found', { status: 500 });
@@ -996,13 +997,24 @@ async function handleWebDAVFile(context, metadata, encodedFileName, fileType) {
                 method: request.method === 'HEAD' ? 'HEAD' : 'GET',
                 headers: fetchHeaders,
             });
+
+            if (!response.ok && response.status !== 206 && response.status !== 304 && webdavCredentials.baseUrl && filePath) {
+                try {
+                    const webdavAPI = new WebDAVAPI(webdavCredentials);
+                    response = await webdavAPI.getFile(filePath, {
+                        method: request.method === 'HEAD' ? 'HEAD' : 'GET',
+                        headers: fetchHeaders,
+                    });
+                } catch (fallbackError) {
+                    console.warn('WebDAV public URL fallback failed:', fallbackError.message);
+                }
+            }
         } else {
-            const webdavConfig = await resolveWebDAVConfig(context.env, metadata);
-            if (!webdavConfig) {
+            if (!webdavCredentials.baseUrl || !filePath) {
                 return new Response('Error: WebDAV channel config not found', { status: 500 });
             }
 
-            const webdavAPI = new WebDAVAPI(webdavConfig);
+            const webdavAPI = new WebDAVAPI(webdavCredentials);
             response = await webdavAPI.getFile(filePath, {
                 method: request.method === 'HEAD' ? 'HEAD' : 'GET',
                 headers: fetchHeaders,
@@ -1039,29 +1051,14 @@ async function handleWebDAVFile(context, metadata, encodedFileName, fileType) {
     }
 }
 
-// 辅助函数：使用 Web Crypto API 验证 HMAC-SHA256 签名是否合法
-async function verifyHmacSha256(message, receivedHex, secret) {
-    const encoder = new TextEncoder();
-    const keyData = encoder.encode(secret);
-    const messageData = encoder.encode(message);
+function getWebDAVPublicFileUrl(webdavCredentials, filePath) {
+    if (webdavCredentials.publicUrl && filePath) {
+        try {
+            return buildWebDAVUrl(webdavCredentials.publicUrl, filePath);
+        } catch (error) {
+            console.warn('Invalid WebDAV public URL config:', error.message);
+        }
+    }
 
-    const cryptoKey = await crypto.subtle.importKey(
-        "raw",
-        keyData,
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"]
-    );
-
-    const signature = await crypto.subtle.sign(
-        "HMAC",
-        cryptoKey,
-        messageData
-    );
-
-    const expectedHex = Array.from(new Uint8Array(signature))
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
-
-    return expectedHex === receivedHex;
+    return '';
 }
