@@ -19,6 +19,41 @@ import {
 } from '../utils/metadata/channelCredentials.js';
 import { buildCdnFileUrl } from '../utils/metadata/metadataView.js';
 
+// ====================================================
+// 辅助函数：使用 Web Crypto API 验证 HMAC-SHA256 签名是否合法
+// 使用 globalThis 确保兼容性，防止构建工具报 'crypto is not defined' 错误
+// ====================================================
+async function verifyHmacSha256(message, receivedHex, secret) {
+    const cryptoObj = typeof crypto !== 'undefined' ? crypto : (typeof globalThis !== 'undefined' ? globalThis.crypto : null);
+    if (!cryptoObj || !cryptoObj.subtle) {
+        throw new Error("Web Crypto API is not supported in this environment");
+    }
+
+    const encoder = new TextEncoder();
+    const keyData = encoder.encode(secret);
+    const messageData = encoder.encode(message);
+
+    const cryptoKey = await cryptoObj.subtle.importKey(
+        "raw",
+        keyData,
+        { name: "HMAC", hash: { name: "SHA-256" } },
+        false,
+        ["sign"]
+    );
+
+    const signature = await cryptoObj.subtle.sign(
+        "HMAC",
+        cryptoKey,
+        messageData
+    );
+
+    const expectedHex = Array.from(new Uint8Array(signature))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+
+    return expectedHex === receivedHex;
+}
+
 
 export async function onRequest(context) {  // Contents of context object
     const {
@@ -45,6 +80,44 @@ export async function onRequest(context) {  // Contents of context object
 
     const url = new URL(request.url);
     context.url = url;
+
+    // ====================================================
+    // 1. 安全校验：非管理员预览请求，必须校验短期数字签名
+    // 确保此时 url 和 env 已正确初始化
+    // ====================================================
+    const fromAdmin = url.searchParams.get('from') === 'admin';
+    if (!fromAdmin) {
+        const secretKey = env.SECURE_TOKEN_SECRET;
+        
+        // 只有在 Cloudflare 后台配置了 SECURE_TOKEN_SECRET 变量时才强制启用校验
+        if (secretKey) {
+            const token = url.searchParams.get('token');
+            const expires = url.searchParams.get('expires');
+
+            if (!token || !expires) {
+                return new Response('Error: Access Denied (Missing Signature Token)', { status: 403 });
+            }
+
+            // 检查链接是否已过期
+            const now = Math.floor(Date.now() / 1000);
+            if (now > parseInt(expires, 10)) {
+                return new Response('Error: Link Expired', { status: 403 });
+            }
+
+            // 验证签名完整性 (匹配：文件路径 + 到期时间戳)
+            const filePath = decodeURIComponent(url.pathname); 
+            const message = `${filePath}|${expires}`;
+            try {
+                const isValid = await verifyHmacSha256(message, token, secretKey);
+                if (!isValid) {
+                    return new Response('Error: Invalid Signature Token', { status: 403 });
+                }
+            } catch (err) {
+                return new Response(`Error: Signature Verification Failed (${err.message})`, { status: 500 });
+            }
+        }
+    }
+    // ====================================================
 
     const Referer = request.headers.get('Referer')
     context.Referer = Referer;
